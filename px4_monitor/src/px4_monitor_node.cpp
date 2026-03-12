@@ -260,28 +260,21 @@ int main(int argc, char** argv) {
     std::thread pub_thread(constant_publisher_routine);
 
     // --- UI State Variables ---
-    // Tab 1 Vars
     std::string tx_str = "0.0", ty_str = "0.0", tz_str = "1.5", tyaw_str = "0.0";
     std::string takeoff_h_str = "1.5";
-    
-    // Tab 2 Vars (Params)
     std::string p_ev_str = "0", p_gps_str = "0", p_hgt_str = "0";
-    
-    // Tab 3 Vars (Move Base)
     std::string mb_x = "0.0", mb_y = "0.0", mb_z = "0.0", mb_yaw = "0.0";
 
-    // Tab Selection (现在支持3个Tab)
     int tab_index = 0;
     std::vector<std::string> tab_entries = { " 1. Flight Control ", " 2. PX4 Params ", " 3. Move Base " };
     auto tab_toggle = Toggle(&tab_entries, &tab_index);
 
     // =========================================================================
-    // 1. 组件定义：Tab 1 (飞行控制)
+    // 1. Tab 1 (飞行控制) - 逻辑与渲染解耦封装
     // =========================================================================
     Component input_takeoff_h = Input(&takeoff_h_str, "H");
     auto btn_takeoff = Button("   AUTO TAKEOFF   ", [&] {
-        try { double h = std::stof(takeoff_h_str); std::thread(takeoff_routine, h).detach(); } 
-        catch (...) { set_log("Invalid Takeoff Height"); }
+        try { double h = std::stof(takeoff_h_str); std::thread(takeoff_routine, h).detach(); } catch (...) { set_log("Invalid Takeoff Height"); }
     }, ButtonOption::Animated(Color::RedLight));
 
     auto btn_offboard = Button("  OFFBOARD (FLY)  ", [&] { std::thread([]{ set_mode("OFFBOARD"); }).detach(); }, ButtonOption::Animated(Color::CyanLight));
@@ -293,11 +286,6 @@ int main(int argc, char** argv) {
     }, ButtonOption::Animated(Color::GreenLight));
     auto btn_land = Button("    AUTO.LAND     ", [&] { std::thread([]{ set_mode("AUTO.LAND"); }).detach(); }, ButtonOption::Animated(Color::YellowLight));
 
-    auto action_comp = Container::Vertical({
-        Container::Horizontal({input_takeoff_h, btn_takeoff}),
-        btn_offboard, btn_loiter, btn_land
-    });
-
     Component input_x = Input(&tx_str, "X"); Component input_y = Input(&ty_str, "Y");
     Component input_z = Input(&tz_str, "Z"); Component input_yaw = Input(&tyaw_str, "Yaw");
     auto btn_send_sp = Button(" UPDATE SETPOINT ", [&] {
@@ -308,26 +296,37 @@ int main(int argc, char** argv) {
         } catch (...) { set_log("Invalid Input"); }
     }, ButtonOption::Animated(Color::BlueLight));
 
-    auto nav_comp = Container::Vertical({
-        Container::Horizontal({input_x, input_y}), Container::Horizontal({input_z, input_yaw}), btn_send_sp
+    auto container_tab1 = Container::Horizontal({
+        Container::Vertical({ Container::Horizontal({input_takeoff_h, btn_takeoff}), btn_offboard, btn_loiter, btn_land }),
+        Container::Vertical({ Container::Horizontal({input_x, input_y}), Container::Horizontal({input_z, input_yaw}), btn_send_sp })
     });
 
-    auto container_tab1 = Container::Horizontal({ action_comp, nav_comp });
+    // 【核心优化点】直接将 Tab 1 的渲染与容器绑定，这样不显示时它完全被挂起
+    auto tab1_renderer = Renderer(container_tab1, [&] {
+        TargetSetPoint target;
+        { std::lock_guard<std::mutex> lock(g_target_mtx); target = g_target_sp; }
+        
+        auto action_ui = window(text(" QUICK ACTIONS ") | bold | hcenter, vbox({
+            hbox({ text(" Alt(m): ") | center, input_takeoff_h->Render() | size(WIDTH, EQUAL, 6) | border, filler(), btn_takeoff->Render() }),
+            separatorLight(), btn_offboard->Render() | xflex, btn_loiter->Render() | xflex, btn_land->Render() | xflex
+        }));
+        auto target_info = hbox({ text(" Target -> ") | dim, text(fmt(target.x) + ", " + fmt(target.y) + ", " + fmt(target.z) + " | Yaw: " + fmt(target.yaw)) | color(Color::Magenta) | bold });
+        auto nav_ui = window(text(" NAVIGATION (FLY TO) ") | bold | hcenter, vbox({
+            hbox({ hbox({ text(" X(m): ") | center, input_x->Render() | size(WIDTH, EQUAL, 8) | border }) | flex, hbox({ text(" Y(m): ") | center, input_y->Render() | size(WIDTH, EQUAL, 8) | border }) | flex }),
+            hbox({ hbox({ text(" Z(m): ") | center, input_z->Render() | size(WIDTH, EQUAL, 8) | border }) | flex, hbox({ text(" Yaw(°): ") | center, input_yaw->Render() | size(WIDTH, EQUAL, 6) | border }) | flex }),
+            filler(), btn_send_sp->Render() | hcenter, separatorLight(), target_info | hcenter
+        }));
+        return hbox({ action_ui | size(WIDTH, EQUAL, 35), nav_ui | flex });
+    });
 
     // =========================================================================
-    // 2. 组件定义：Tab 2 (参数配置)
+    // 2. Tab 2 (参数配置) - 逻辑与渲染解耦封装
     // =========================================================================
-    
-    Component in_ev = Input(&p_ev_str, "Val");
-    Component in_gps = Input(&p_gps_str, "Val");
-    Component in_hgt = Input(&p_hgt_str, "Val");
-
+    Component in_ev = Input(&p_ev_str, "Val"); Component in_gps = Input(&p_gps_str, "Val"); Component in_hgt = Input(&p_hgt_str, "Val");
     auto btn_get_ev = Button(" GET ", [&]{ p_ev_str = get_param("EKF2_EV_CTRL"); }, ButtonOption::Simple());
     auto btn_set_ev = Button(" SET ", [&]{ set_param("EKF2_EV_CTRL", p_ev_str); }, ButtonOption::Animated(Color::Red));
-
     auto btn_get_gps = Button(" GET ", [&]{ p_gps_str = get_param("EKF2_GPS_CTRL"); }, ButtonOption::Simple());
     auto btn_set_gps = Button(" SET ", [&]{ set_param("EKF2_GPS_CTRL", p_gps_str); }, ButtonOption::Animated(Color::Red));
-
     auto btn_get_hgt = Button(" GET ", [&]{ p_hgt_str = get_param("EKF2_HGT_REF"); }, ButtonOption::Simple());
     auto btn_set_hgt = Button(" SET ", [&]{ set_param("EKF2_HGT_REF", p_hgt_str); }, ButtonOption::Animated(Color::Red));
 
@@ -337,14 +336,24 @@ int main(int argc, char** argv) {
         Container::Horizontal({ in_hgt, btn_set_hgt, btn_get_hgt })
     });
 
+    auto tab2_renderer = Renderer(params_comp, [&] {
+        return window(text(" PX4 PARAM CONFIGURATION ") | bold | hcenter, vbox({
+            hbox({ text(" EKF2_EV_CTRL:  ") | size(WIDTH, EQUAL, 16), in_ev->Render() | border | flex, btn_set_ev->Render(), btn_get_ev->Render() }),
+            text(" └─ Bitmask: 0=Disabled, 1=Horiz Pose, 2=Vert Pose, 4=3D Vel, 8=Yaw (e.g. 15=All, 0=None, 15=Default)") | dim | color(Color::GrayDark),
+            separatorLight(),
+            hbox({ text(" EKF2_GPS_CTRL: ") | size(WIDTH, EQUAL, 16), in_gps->Render() | border | flex, btn_set_gps->Render(), btn_get_gps->Render() }),
+            text(" └─ Bitmask: 0=Disabled, 1=Lon/Lat, 2=Altitude, 4=3D Vel, 8=Dual Attenna head (e.g. 15=All, 0=None, 7=Default)") | dim | color(Color::GrayDark),
+            separatorLight(),
+            hbox({ text(" EKF2_HGT_REF:  ") | size(WIDTH, EQUAL, 16), in_hgt->Render() | border | flex, btn_set_hgt->Render(), btn_get_hgt->Render() }),
+            text(" └─ Source: 0=Barometer, 1=GPS, 2=Range, 3=Vision(EV) (e.g. 1=Default)") | dim | color(Color::GrayDark)
+        }));
+    });
+
     // =========================================================================
-    // 3. 组件定义：Tab 3 (Move Base)
+    // 3. Tab 3 (Move Base) - 逻辑与渲染解耦封装
     // =========================================================================
-    
-    Component in_mb_x = Input(&mb_x, "X");
-    Component in_mb_y = Input(&mb_y, "Y");
-    Component in_mb_z = Input(&mb_z, "Z");
-    Component in_mb_yaw = Input(&mb_yaw, "Yaw");
+    Component in_mb_x = Input(&mb_x, "X"); Component in_mb_y = Input(&mb_y, "Y");
+    Component in_mb_z = Input(&mb_z, "Z"); Component in_mb_yaw = Input(&mb_yaw, "Yaw");
     
     auto btn_send_mb = Button(" PUBLISH MOVE_BASE GOAL ", [&]{
         try {
@@ -354,32 +363,43 @@ int main(int argc, char** argv) {
         } catch(...) { set_log("Invalid Move Base Input"); }
     }, ButtonOption::Animated(Color::Magenta));
 
-    auto mb_comp = Container::Vertical({
-        Container::Horizontal({ in_mb_x, in_mb_y, in_mb_z, in_mb_yaw }),
-        btn_send_mb
+    auto mb_comp = Container::Vertical({ Container::Horizontal({ in_mb_x, in_mb_y, in_mb_z, in_mb_yaw }), btn_send_mb });
+
+    auto tab3_renderer = Renderer(mb_comp, [&] {
+        return window(text(" ROS NAVIGATION (MOVE BASE) ") | bold | hcenter, vbox({
+            text(" Publish goal to /move_base_simple/goal ") | hcenter | dim,
+            separatorLight(),
+            hbox({ 
+                hbox({ text(" X[m]: ") | center, in_mb_x->Render() | size(WIDTH, EQUAL, 8) | border }),
+                hbox({ text(" Y[m]: ") | center, in_mb_y->Render() | size(WIDTH, EQUAL, 8) | border }),
+                hbox({ text(" Z[m]: ") | center, in_mb_z->Render() | size(WIDTH, EQUAL, 8) | border }),
+                hbox({ text(" Yaw[°]: ") | center, in_mb_yaw->Render() | size(WIDTH, EQUAL, 8) | border })
+            }) | hcenter,
+            separatorLight(),
+            btn_send_mb->Render() | hcenter
+        }));
     });
 
     // =========================================================================
-    // 4. 全局布局容器
+    // 4. 全局布局引擎
     // =========================================================================
+    // 将 Renderer 注入到 Container::Tab，实现了原生的分支裁剪
+    auto tab_container = Container::Tab({ tab1_renderer, tab2_renderer, tab3_renderer }, &tab_index);
+    
     auto main_container = Container::Vertical({
         tab_toggle,
-        // Tab 容器现在包含 3 个页面
-        Container::Tab({ container_tab1, params_comp, mb_comp }, &tab_index)
+        tab_container
     });
 
     auto screen = ScreenInteractive::Fullscreen();
 
     // =========================================================================
-    // 5. 渲染逻辑 (Renderer)
+    // 5. 主渲染逻辑 (Main Renderer)
     // =========================================================================
-    auto renderer = Renderer(main_container, [&] {
+    auto main_renderer = Renderer(main_container, [&] {
         DroneState current;
-        TargetSetPoint target;
         { std::lock_guard<std::mutex> lock(g_state_mtx); current = g_drone_state; }
-        { std::lock_guard<std::mutex> lock(g_target_mtx); target = g_target_sp; }
 
-        // --- 公共头部：状态面板 ---
         auto status_panel = window(text(" SYSTEM STATUS ") | bold, vbox({
             hbox({ text(" Connection: ") | dim, text(current.connected ? "CONNECTED " : "DISCONNECTED") | color(current.connected ? Color::Green : Color::Red) | bold }),
             hbox({ text(" Flight Mode:") | dim, text(" " + current.mode) | color(Color::Yellow) | bold }),
@@ -403,69 +423,14 @@ int main(int argc, char** argv) {
         });
         auto data_panel = window(text(" TELEMETRY DATA ") | bold, telemetry_content);
 
-        // --- Tab 1 内容渲染 ---
-        auto tab1_ui = [&] {
-            auto action_ui = window(text(" QUICK ACTIONS ") | bold | hcenter, vbox({
-                hbox({ text(" Alt(m): ") | center, input_takeoff_h->Render() | size(WIDTH, EQUAL, 6) | border, filler(), btn_takeoff->Render() }),
-                separatorLight(), btn_offboard->Render() | xflex, btn_loiter->Render() | xflex, btn_land->Render() | xflex
-            }));
-            auto target_info = hbox({ text(" Target -> ") | dim, text(fmt(target.x) + ", " + fmt(target.y) + ", " + fmt(target.z) + " | Yaw: " + fmt(target.yaw)) | color(Color::Magenta) | bold });
-            auto nav_ui = window(text(" NAVIGATION (FLY TO) ") | bold | hcenter, vbox({
-                hbox({ hbox({ text(" X(m): ") | center, input_x->Render() | size(WIDTH, EQUAL, 8) | border }) | flex, hbox({ text(" Y(m): ") | center, input_y->Render() | size(WIDTH, EQUAL, 8) | border }) | flex }),
-                hbox({ hbox({ text(" Z(m): ") | center, input_z->Render() | size(WIDTH, EQUAL, 8) | border }) | flex, hbox({ text(" Yaw(°): ") | center, input_yaw->Render() | size(WIDTH, EQUAL, 6) | border }) | flex }),
-                filler(), btn_send_sp->Render() | hcenter, separatorLight(), target_info | hcenter
-            }));
-            return hbox({ action_ui | size(WIDTH, EQUAL, 35), nav_ui | flex });
-        };
-
-        // --- Tab 2 内容渲染 (带参数说明) ---
-        auto tab2_ui = [&] {
-            return window(text(" PX4 PARAM CONFIGURATION ") | bold | hcenter, vbox({
-                // EKF2_EV_CTRL
-                hbox({ text(" EKF2_EV_CTRL:  ") | size(WIDTH, EQUAL, 16), in_ev->Render() | border | flex, btn_set_ev->Render(), btn_get_ev->Render() }),
-                text(" └─ Bitmask: 0=Disabled, 1=Horiz Pose, 2=Vert Pose, 4=3D Vel, 8=Yaw (e.g. 15=All, 0=None, 15=Default)") | dim | color(Color::GrayDark),
-                separatorLight(),
-                
-                // EKF2_GPS_CTRL
-                hbox({ text(" EKF2_GPS_CTRL: ") | size(WIDTH, EQUAL, 16), in_gps->Render() | border | flex, btn_set_gps->Render(), btn_get_gps->Render() }),
-                text(" └─ Bitmask: 0=Disabled, 1=Lon/Lat, 2=Altitude, 4=3D Vel, 8=Dual Attenna head (e.g. 15=All, 0=None, 7=Default)") | dim | color(Color::GrayDark),
-                separatorLight(),
-
-                // EKF2_HGT_REF
-                hbox({ text(" EKF2_HGT_REF:  ") | size(WIDTH, EQUAL, 16), in_hgt->Render() | border | flex, btn_set_hgt->Render(), btn_get_hgt->Render() }),
-                text(" └─ Source: 0=Barometer, 1=GPS, 2=Range, 3=Vision(EV) (e.g. 1=Default)") | dim | color(Color::GrayDark)
-            }));
-        };
-
-        // --- Tab 3 内容渲染 (Move Base) ---
-        auto tab3_ui = [&] {
-             return window(text(" ROS NAVIGATION (MOVE BASE) ") | bold | hcenter, vbox({
-                text(" Publish goal to /move_base_simple/goal ") | hcenter | dim,
-                separatorLight(),
-                hbox({ 
-                    hbox({ text(" X[m]: ") | center, in_mb_x->Render() | size(WIDTH, EQUAL, 8) | border }),
-                    hbox({ text(" Y[m]: ") | center, in_mb_y->Render() | size(WIDTH, EQUAL, 8) | border }),
-                    hbox({ text(" Z[m]: ") | center, in_mb_z->Render() | size(WIDTH, EQUAL, 8) | border }),
-                    hbox({ text(" Yaw[°]: ") | center, in_mb_yaw->Render() | size(WIDTH, EQUAL, 8) | border })
-                }) | hcenter,
-                separatorLight(),
-                btn_send_mb->Render() | hcenter
-            }));
-        };
-
-        // --- 整体拼接 ---
-        Element tab_content;
-        if (tab_index == 0) tab_content = tab1_ui();
-        else if (tab_index == 1) tab_content = tab2_ui();
-        else tab_content = tab3_ui();
-
+        // 主框架拼装，无需再写 if-else 判断，tab_container 会自动只渲染当前激活的子 Renderer
         return vbox({
             text("✈ PX4 ROS1 COMMAND CENTER") | bold | hcenter | color(Color::Cyan),
             separatorDouble(),
             hbox({ status_panel | size(WIDTH, EQUAL, 35), data_panel | flex }),
             separator(),
-            tab_toggle->Render() | hcenter | border, // Tab 切换按钮
-            tab_content | flex, // 根据 Index 显示内容
+            tab_toggle->Render() | hcenter | border, 
+            tab_container->Render() | flex,  // <--- 这里的组件树实现了极致挂起优化
             filler(),
             hbox({ text(" LOG ") | bold | color(Color::Black) | bgcolor(Color::White), text(" " + g_log_msg) | color(Color::White) }) | border
         });
@@ -479,15 +444,14 @@ int main(int argc, char** argv) {
         }
     });
 
-    // 启动时自动获取一次参数
     std::thread([&]{
-        std::this_thread::sleep_for(std::chrono::seconds(1)); // 等 ROS 连接
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         p_ev_str = get_param("EKF2_EV_CTRL");
         p_gps_str = get_param("EKF2_GPS_CTRL");
         p_hgt_str = get_param("EKF2_HGT_REF");
     }).detach();
 
-    screen.Loop(renderer);
+    screen.Loop(main_renderer); // 传入主渲染器
 
     g_enable_constant_publish = false;
     ros::shutdown();
