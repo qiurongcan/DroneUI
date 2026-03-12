@@ -2,6 +2,8 @@
 #include <mavros_msgs/State.h>
 #include <mavros_msgs/CommandBool.h>
 #include <mavros_msgs/SetMode.h>
+#include <mavros_msgs/ParamGet.h>
+#include <mavros_msgs/ParamSet.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TwistStamped.h>
 #include <tf/transform_datatypes.h>
@@ -36,12 +38,8 @@ struct DroneState {
     double roll = 0.0, pitch = 0.0, yaw = 0.0;
 };
 
-// 目标设定点结构
 struct TargetSetPoint {
-    double x = 0.0;
-    double y = 0.0;
-    double z = 0.0;
-    double yaw = 0.0;
+    double x = 0.0; double y = 0.0; double z = 0.0; double yaw = 0.0;
 };
 
 // 全局变量
@@ -56,11 +54,14 @@ std::atomic<bool> g_enable_constant_publish(true);
 
 // ROS 全局对象
 ros::Publisher g_local_pos_pub;
+ros::Publisher g_move_base_goal_pub;
 ros::ServiceClient g_arming_client;
 ros::ServiceClient g_set_mode_client;
+ros::ServiceClient g_param_get_client;
+ros::ServiceClient g_param_set_client;
 
 // -----------------------------------------------------------------------------
-// ROS 回调
+// ROS 回调与辅助函数
 // -----------------------------------------------------------------------------
 void state_cb(const mavros_msgs::State::ConstPtr& msg) {
     std::lock_guard<std::mutex> lock(g_state_mtx);
@@ -94,9 +95,6 @@ void vel_cb(const geometry_msgs::TwistStamped::ConstPtr& msg) {
     g_drone_state.vz = msg->twist.linear.z;
 }
 
-// -----------------------------------------------------------------------------
-// 辅助函数
-// -----------------------------------------------------------------------------
 void set_log(std::string msg) { g_log_msg = msg; }
 
 std::string fmt(double val, int precision = 2) {
@@ -131,6 +129,38 @@ bool set_mode(std::string mode_name) {
     }
     set_log("Failed to switch to " + mode_name);
     return false;
+}
+
+std::string get_param(const std::string& param_id) {
+    mavros_msgs::ParamGet srv;
+    srv.request.param_id = param_id;
+    if (g_param_get_client.call(srv) && srv.response.success) {
+        if (srv.response.value.integer != 0 || srv.response.value.real == 0.0) 
+            return std::to_string(srv.response.value.integer);
+        else 
+            return fmt(srv.response.value.real);
+    }
+    return "ERR";
+}
+
+void set_param(const std::string& param_id, const std::string& value_str) {
+    try {
+        mavros_msgs::ParamSet srv;
+        srv.request.param_id = param_id;
+        if (value_str.find('.') != std::string::npos) {
+            srv.request.value.real = std::stof(value_str);
+        } else {
+            srv.request.value.integer = std::stol(value_str);
+        }
+        
+        if (g_param_set_client.call(srv) && srv.response.success) {
+            set_log("Set " + param_id + " success!");
+        } else {
+            set_log("Failed to set " + param_id);
+        }
+    } catch (...) {
+        set_log("Invalid Param Format");
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -193,13 +223,10 @@ void takeoff_routine(double h) {
             if (std::abs(state.z - h) < 0.2) {
                 set_log("Takeoff Complete. Holding (AUTO.LOITER).");
                 set_mode("AUTO.LOITER");
-                
                 {
                     std::lock_guard<std::mutex> lock(g_target_mtx);
-                    g_target_sp.x = state.x;
-                    g_target_sp.y = state.y;
-                    g_target_sp.z = state.z; 
-                    g_target_sp.yaw = state.yaw;
+                    g_target_sp.x = state.x; g_target_sp.y = state.y;
+                    g_target_sp.z = state.z; g_target_sp.yaw = state.yaw;
                 }
                 break;
             }
@@ -222,94 +249,129 @@ int main(int argc, char** argv) {
     ros::Subscriber velocity_sub = nh.subscribe<geometry_msgs::TwistStamped>("mavros/local_position/velocity_local", 10, vel_cb);
 
     g_local_pos_pub = nh.advertise<geometry_msgs::PoseStamped>("mavros/setpoint_position/local", 10);
+    g_move_base_goal_pub = nh.advertise<geometry_msgs::PoseStamped>("move_base_simple/goal", 10);
+    
     g_arming_client = nh.serviceClient<mavros_msgs::CommandBool>("mavros/cmd/arming");
     g_set_mode_client = nh.serviceClient<mavros_msgs::SetMode>("mavros/set_mode");
+    g_param_get_client = nh.serviceClient<mavros_msgs::ParamGet>("mavros/param/get");
+    g_param_set_client = nh.serviceClient<mavros_msgs::ParamSet>("mavros/param/set");
 
     std::thread ros_thread([](){ ros::spin(); });
     std::thread pub_thread(constant_publisher_routine);
 
-    // --- UI State ---
-    std::string tx_str = "0.0";
-    std::string ty_str = "0.0";
-    std::string tz_str = "1.5";
-    std::string tyaw_str = "0.0";
+    // --- UI State Variables ---
+    // Tab 1 Vars
+    std::string tx_str = "0.0", ty_str = "0.0", tz_str = "1.5", tyaw_str = "0.0";
     std::string takeoff_h_str = "1.5";
+    
+    // Tab 2 Vars (Params)
+    std::string p_ev_str = "0", p_gps_str = "0", p_hgt_str = "0";
+    
+    // Tab 3 Vars (Move Base)
+    std::string mb_x = "0.0", mb_y = "0.0", mb_z = "0.0", mb_yaw = "0.0";
+
+    // Tab Selection (现在支持3个Tab)
+    int tab_index = 0;
+    std::vector<std::string> tab_entries = { " 1. Flight Control ", " 2. PX4 Params ", " 3. Move Base " };
+    auto tab_toggle = Toggle(&tab_entries, &tab_index);
 
     // =========================================================================
-    // 1. 定义纯交互组件 (Components)
+    // 1. 组件定义：Tab 1 (飞行控制)
     // =========================================================================
-    
-    // -- 左侧：快捷动作区 (Takeoff & Modes) --
     Component input_takeoff_h = Input(&takeoff_h_str, "H");
     auto btn_takeoff = Button("   AUTO TAKEOFF   ", [&] {
-        try {
-            double h = std::stof(takeoff_h_str);
-            std::thread(takeoff_routine, h).detach();
-        } catch (...) { set_log("Invalid Takeoff Height"); }
+        try { double h = std::stof(takeoff_h_str); std::thread(takeoff_routine, h).detach(); } 
+        catch (...) { set_log("Invalid Takeoff Height"); }
     }, ButtonOption::Animated(Color::RedLight));
 
-    auto btn_offboard = Button("  OFFBOARD (FLY)  ", [&] {
-        std::thread([]{ set_mode("OFFBOARD"); }).detach();
-    }, ButtonOption::Animated(Color::CyanLight));
-
-    auto btn_loiter = Button("AUTO.LOITER (HOLD)", [&] {
-        std::thread([]{ set_mode("AUTO.LOITER"); }).detach();
-        DroneState current;
-        { std::lock_guard<std::mutex> lock(g_state_mtx); current = g_drone_state; }
-        {
-            std::lock_guard<std::mutex> lock(g_target_mtx);
-            g_target_sp.x = current.x; g_target_sp.y = current.y;
-            g_target_sp.z = current.z; g_target_sp.yaw = current.yaw;
-            tx_str = fmt(current.x); ty_str = fmt(current.y);
-            tz_str = fmt(current.z); tyaw_str = fmt(current.yaw);
-        }
+    auto btn_offboard = Button("  OFFBOARD (FLY)  ", [&] { std::thread([]{ set_mode("OFFBOARD"); }).detach(); }, ButtonOption::Animated(Color::CyanLight));
+    auto btn_loiter = Button("AUTO.LOITER (HOLD)", [&] { 
+        std::thread([]{ set_mode("AUTO.LOITER"); }).detach(); 
+        DroneState c; { std::lock_guard<std::mutex> lock(g_state_mtx); c = g_drone_state; }
+        { std::lock_guard<std::mutex> lock(g_target_mtx); g_target_sp = {c.x, c.y, c.z, c.yaw}; }
+        tx_str = fmt(c.x); ty_str = fmt(c.y); tz_str = fmt(c.z); tyaw_str = fmt(c.yaw);
     }, ButtonOption::Animated(Color::GreenLight));
+    auto btn_land = Button("    AUTO.LAND     ", [&] { std::thread([]{ set_mode("AUTO.LAND"); }).detach(); }, ButtonOption::Animated(Color::YellowLight));
 
-    auto btn_land = Button("    AUTO.LAND     ", [&] {
-        std::thread([]{ set_mode("AUTO.LAND"); }).detach();
-    }, ButtonOption::Animated(Color::YellowLight));
-
-    // 左侧逻辑容器
     auto action_comp = Container::Vertical({
         Container::Horizontal({input_takeoff_h, btn_takeoff}),
-        btn_offboard,
-        btn_loiter,
-        btn_land
+        btn_offboard, btn_loiter, btn_land
     });
 
-    // -- 右侧：指点飞行导航区 (Navigation) --
-    Component input_x = Input(&tx_str, "X");
-    Component input_y = Input(&ty_str, "Y");
-    Component input_z = Input(&tz_str, "Z");
-    Component input_yaw = Input(&tyaw_str, "Yaw");
+    Component input_x = Input(&tx_str, "X"); Component input_y = Input(&ty_str, "Y");
+    Component input_z = Input(&tz_str, "Z"); Component input_yaw = Input(&tyaw_str, "Yaw");
     auto btn_send_sp = Button(" UPDATE SETPOINT ", [&] {
         try {
             std::lock_guard<std::mutex> lock(g_target_mtx);
-            g_target_sp.x = std::stof(tx_str);
-            g_target_sp.y = std::stof(ty_str);
-            g_target_sp.z = std::stof(tz_str);
-            g_target_sp.yaw = std::stof(tyaw_str);
-            set_log("Setpoint Updated. Switch to OFFBOARD to execute.");
-        } catch (...) { set_log("Invalid Setpoint Input"); }
+            g_target_sp = {std::stof(tx_str), std::stof(ty_str), std::stof(tz_str), std::stof(tyaw_str)};
+            set_log("Setpoint Updated.");
+        } catch (...) { set_log("Invalid Input"); }
     }, ButtonOption::Animated(Color::BlueLight));
 
-    // 右侧逻辑容器
     auto nav_comp = Container::Vertical({
-        Container::Horizontal({input_x, input_y}),
-        Container::Horizontal({input_z, input_yaw}),
-        btn_send_sp
+        Container::Horizontal({input_x, input_y}), Container::Horizontal({input_z, input_yaw}), btn_send_sp
     });
 
-    // 组合全局逻辑容器
-    auto main_container = Container::Horizontal({
-        action_comp, 
-        nav_comp
+    auto container_tab1 = Container::Horizontal({ action_comp, nav_comp });
+
+    // =========================================================================
+    // 2. 组件定义：Tab 2 (参数配置)
+    // =========================================================================
+    
+    Component in_ev = Input(&p_ev_str, "Val");
+    Component in_gps = Input(&p_gps_str, "Val");
+    Component in_hgt = Input(&p_hgt_str, "Val");
+
+    auto btn_get_ev = Button(" GET ", [&]{ p_ev_str = get_param("EKF2_EV_CTRL"); }, ButtonOption::Simple());
+    auto btn_set_ev = Button(" SET ", [&]{ set_param("EKF2_EV_CTRL", p_ev_str); }, ButtonOption::Animated(Color::Red));
+
+    auto btn_get_gps = Button(" GET ", [&]{ p_gps_str = get_param("EKF2_GPS_CTRL"); }, ButtonOption::Simple());
+    auto btn_set_gps = Button(" SET ", [&]{ set_param("EKF2_GPS_CTRL", p_gps_str); }, ButtonOption::Animated(Color::Red));
+
+    auto btn_get_hgt = Button(" GET ", [&]{ p_hgt_str = get_param("EKF2_HGT_REF"); }, ButtonOption::Simple());
+    auto btn_set_hgt = Button(" SET ", [&]{ set_param("EKF2_HGT_REF", p_hgt_str); }, ButtonOption::Animated(Color::Red));
+
+    auto params_comp = Container::Vertical({
+        Container::Horizontal({ in_ev, btn_set_ev, btn_get_ev }),
+        Container::Horizontal({ in_gps, btn_set_gps, btn_get_gps }),
+        Container::Horizontal({ in_hgt, btn_set_hgt, btn_get_hgt })
+    });
+
+    // =========================================================================
+    // 3. 组件定义：Tab 3 (Move Base)
+    // =========================================================================
+    
+    Component in_mb_x = Input(&mb_x, "X");
+    Component in_mb_y = Input(&mb_y, "Y");
+    Component in_mb_z = Input(&mb_z, "Z");
+    Component in_mb_yaw = Input(&mb_yaw, "Yaw");
+    
+    auto btn_send_mb = Button(" PUBLISH MOVE_BASE GOAL ", [&]{
+        try {
+            auto pose = create_pose(std::stof(mb_x), std::stof(mb_y), std::stof(mb_z), std::stof(mb_yaw));
+            g_move_base_goal_pub.publish(pose);
+            set_log("Move Base Goal Published: " + mb_x + ", " + mb_y + ", " + mb_z);
+        } catch(...) { set_log("Invalid Move Base Input"); }
+    }, ButtonOption::Animated(Color::Magenta));
+
+    auto mb_comp = Container::Vertical({
+        Container::Horizontal({ in_mb_x, in_mb_y, in_mb_z, in_mb_yaw }),
+        btn_send_mb
+    });
+
+    // =========================================================================
+    // 4. 全局布局容器
+    // =========================================================================
+    auto main_container = Container::Vertical({
+        tab_toggle,
+        // Tab 容器现在包含 3 个页面
+        Container::Tab({ container_tab1, params_comp, mb_comp }, &tab_index)
     });
 
     auto screen = ScreenInteractive::Fullscreen();
 
     // =========================================================================
-    // 2. 定义视觉渲染 (Renderer)
+    // 5. 渲染逻辑 (Renderer)
     // =========================================================================
     auto renderer = Renderer(main_container, [&] {
         DroneState current;
@@ -317,108 +379,99 @@ int main(int argc, char** argv) {
         { std::lock_guard<std::mutex> lock(g_state_mtx); current = g_drone_state; }
         { std::lock_guard<std::mutex> lock(g_target_mtx); target = g_target_sp; }
 
-        // --- 顶部左：系统状态 ---
+        // --- 公共头部：状态面板 ---
         auto status_panel = window(text(" SYSTEM STATUS ") | bold, vbox({
             hbox({ text(" Connection: ") | dim, text(current.connected ? "CONNECTED " : "DISCONNECTED") | color(current.connected ? Color::Green : Color::Red) | bold }),
             hbox({ text(" Flight Mode:") | dim, text(" " + current.mode) | color(Color::Yellow) | bold }),
             hbox({ text(" Arm Status: ") | dim, text(current.armed ? "ARMED  " : "DISARMED") | color(current.armed ? Color::Green : Color::Red) | bold }),
         }));
 
-        // --- 顶部右：遥测数据 (位置 + 姿态) ---
-        // 使用 hbox 将位置和姿态左右分开显示
         auto telemetry_content = hbox({
-            // 左半边：位置与速度
             vbox({
-                text(" Position (m) ") | center | bold,
-                separatorLight(),
+                text(" Position (m) ") | center | bold, separatorLight(),
                 hbox({ text(" X: ") | dim, text(fmt(current.x)) | size(WIDTH, EQUAL, 8), text(" Vx: ") | dim, text(fmt(current.vx)) | size(WIDTH, EQUAL, 6) }),
                 hbox({ text(" Y: ") | dim, text(fmt(current.y)) | size(WIDTH, EQUAL, 8), text(" Vy: ") | dim, text(fmt(current.vy)) | size(WIDTH, EQUAL, 6) }),
                 hbox({ text(" Z: ") | dim, text(fmt(current.z)) | size(WIDTH, EQUAL, 8), text(" Vz: ") | dim, text(fmt(current.vz)) | size(WIDTH, EQUAL, 6) }),
             }) | flex,
-            
-            separatorDouble(), // 中间竖线分隔
-
-            // 右半边：姿态 (Roll/Pitch/Yaw) + 仪表盘模拟
+            separatorDouble(),
             vbox({
-                text(" Attitude (deg) ") | center | bold,
-                separatorLight(),
-                hbox({ 
-                    text(" Roll:  ") | dim, 
-                    text(fmt(current.roll)) | size(WIDTH, EQUAL, 7),
-                    gauge(0.5 + current.roll / 90.0) | flex // 仪表条
-                }),
-                hbox({ 
-                    text(" Pitch: ") | dim, 
-                    text(fmt(current.pitch)) | size(WIDTH, EQUAL, 7),
-                    gauge(0.5 + current.pitch / 90.0) | flex 
-                }),
-                hbox({ 
-                    text(" Yaw:   ") | dim, 
-                    text(fmt(current.yaw)) | size(WIDTH, EQUAL, 7),
-                    gauge(0.5 + current.yaw / 360.0) | flex 
-                }),
+                text(" Attitude (deg) ") | center | bold, separatorLight(),
+                hbox({ text(" Roll:  ") | dim, text(fmt(current.roll)) | size(WIDTH, EQUAL, 7), gauge(0.5 + current.roll / 90.0) | flex }),
+                hbox({ text(" Pitch: ") | dim, text(fmt(current.pitch)) | size(WIDTH, EQUAL, 7), gauge(0.5 + current.pitch / 90.0) | flex }),
+                hbox({ text(" Yaw:   ") | dim, text(fmt(current.yaw)) | size(WIDTH, EQUAL, 7), gauge(0.5 + current.yaw / 360.0) | flex }),
             }) | flex
         });
-
         auto data_panel = window(text(" TELEMETRY DATA ") | bold, telemetry_content);
 
-        // --- 中左：快捷动作 UI ---
-        auto action_ui = window(text(" QUICK ACTIONS ") | bold | hcenter, vbox({
-            hbox({ 
-                text(" Alt(m): ") | center, 
-                input_takeoff_h->Render() | size(WIDTH, EQUAL, 6) | border, 
-                filler(), 
-                btn_takeoff->Render() 
-            }),
-            separatorLight(),
-            btn_offboard->Render() | xflex,
-            btn_loiter->Render() | xflex,
-            btn_land->Render() | xflex
-        }));
+        // --- Tab 1 内容渲染 ---
+        auto tab1_ui = [&] {
+            auto action_ui = window(text(" QUICK ACTIONS ") | bold | hcenter, vbox({
+                hbox({ text(" Alt(m): ") | center, input_takeoff_h->Render() | size(WIDTH, EQUAL, 6) | border, filler(), btn_takeoff->Render() }),
+                separatorLight(), btn_offboard->Render() | xflex, btn_loiter->Render() | xflex, btn_land->Render() | xflex
+            }));
+            auto target_info = hbox({ text(" Target -> ") | dim, text(fmt(target.x) + ", " + fmt(target.y) + ", " + fmt(target.z) + " | Yaw: " + fmt(target.yaw)) | color(Color::Magenta) | bold });
+            auto nav_ui = window(text(" NAVIGATION (FLY TO) ") | bold | hcenter, vbox({
+                hbox({ hbox({ text(" X(m): ") | center, input_x->Render() | size(WIDTH, EQUAL, 8) | border }) | flex, hbox({ text(" Y(m): ") | center, input_y->Render() | size(WIDTH, EQUAL, 8) | border }) | flex }),
+                hbox({ hbox({ text(" Z(m): ") | center, input_z->Render() | size(WIDTH, EQUAL, 8) | border }) | flex, hbox({ text(" Yaw(°): ") | center, input_yaw->Render() | size(WIDTH, EQUAL, 6) | border }) | flex }),
+                filler(), btn_send_sp->Render() | hcenter, separatorLight(), target_info | hcenter
+            }));
+            return hbox({ action_ui | size(WIDTH, EQUAL, 35), nav_ui | flex });
+        };
 
-        // --- 中右：导航 UI ---
-        auto target_info = hbox({
-            text(" Target -> ") | dim,
-            text(fmt(target.x) + ", " + fmt(target.y) + ", " + fmt(target.z) + " | Yaw: " + fmt(target.yaw)) | color(Color::Magenta) | bold
-        });
+        // --- Tab 2 内容渲染 (带参数说明) ---
+        auto tab2_ui = [&] {
+            return window(text(" PX4 PARAM CONFIGURATION ") | bold | hcenter, vbox({
+                // EKF2_EV_CTRL
+                hbox({ text(" EKF2_EV_CTRL:  ") | size(WIDTH, EQUAL, 16), in_ev->Render() | border | flex, btn_set_ev->Render(), btn_get_ev->Render() }),
+                text(" └─ Bitmask: 0=Disabled, 1=Horiz Pose, 2=Vert Pose, 4=3D Vel, 8=Yaw (e.g. 15=All, 0=None, 15=Default)") | dim | color(Color::GrayDark),
+                separatorLight(),
+                
+                // EKF2_GPS_CTRL
+                hbox({ text(" EKF2_GPS_CTRL: ") | size(WIDTH, EQUAL, 16), in_gps->Render() | border | flex, btn_set_gps->Render(), btn_get_gps->Render() }),
+                text(" └─ Bitmask: 0=Disabled, 1=Lon/Lat, 2=Altitude, 4=3D Vel, 8=Dual Attenna head (e.g. 15=All, 0=None, 7=Default)") | dim | color(Color::GrayDark),
+                separatorLight(),
 
-        auto nav_ui = window(text(" NAVIGATION (FLY TO) ") | bold | hcenter, vbox({
-            hbox({
-                hbox({ text(" X(m): ") | center, input_x->Render() | size(WIDTH, EQUAL, 8) | border }) | flex,
-                hbox({ text(" Y(m): ") | center, input_y->Render() | size(WIDTH, EQUAL, 8) | border }) | flex,
-            }),
-            hbox({
-                hbox({ text(" Z(m): ") | center, input_z->Render() | size(WIDTH, EQUAL, 8) | border }) | flex,
-                hbox({ text(" Yaw(°): ") | center, input_yaw->Render() | size(WIDTH, EQUAL, 6) | border }) | flex,
-            }),
-            filler(),
-            btn_send_sp->Render() | hcenter,
-            separatorLight(),
-            target_info | hcenter
-        }));
+                // EKF2_HGT_REF
+                hbox({ text(" EKF2_HGT_REF:  ") | size(WIDTH, EQUAL, 16), in_hgt->Render() | border | flex, btn_set_hgt->Render(), btn_get_hgt->Render() }),
+                text(" └─ Source: 0=Barometer, 1=GPS, 2=Range, 3=Vision(EV) (e.g. 1=Default)") | dim | color(Color::GrayDark)
+            }));
+        };
+
+        // --- Tab 3 内容渲染 (Move Base) ---
+        auto tab3_ui = [&] {
+             return window(text(" ROS NAVIGATION (MOVE BASE) ") | bold | hcenter, vbox({
+                text(" Publish goal to /move_base_simple/goal ") | hcenter | dim,
+                separatorLight(),
+                hbox({ 
+                    hbox({ text(" X[m]: ") | center, in_mb_x->Render() | size(WIDTH, EQUAL, 8) | border }),
+                    hbox({ text(" Y[m]: ") | center, in_mb_y->Render() | size(WIDTH, EQUAL, 8) | border }),
+                    hbox({ text(" Z[m]: ") | center, in_mb_z->Render() | size(WIDTH, EQUAL, 8) | border }),
+                    hbox({ text(" Yaw[°]: ") | center, in_mb_yaw->Render() | size(WIDTH, EQUAL, 8) | border })
+                }) | hcenter,
+                separatorLight(),
+                btn_send_mb->Render() | hcenter
+            }));
+        };
 
         // --- 整体拼接 ---
+        Element tab_content;
+        if (tab_index == 0) tab_content = tab1_ui();
+        else if (tab_index == 1) tab_content = tab2_ui();
+        else tab_content = tab3_ui();
+
         return vbox({
             text("✈ PX4 ROS1 COMMAND CENTER") | bold | hcenter | color(Color::Cyan),
             separatorDouble(),
-            
-            // 顶部两块面板并排 (状态 + 遥测)
             hbox({ status_panel | size(WIDTH, EQUAL, 35), data_panel | flex }),
-            
-            // 中间控制面板并排
-            hbox({ action_ui | size(WIDTH, EQUAL, 35), nav_ui | flex }),
-            
-            filler(), // 填充剩余空间，把日志推到最底下
-            
-            // 底部日志区
-            hbox({
-                text(" LOG ") | bold | color(Color::Black) | bgcolor(Color::White),
-                text(" " + g_log_msg) | color(Color::White)
-            }) | border
+            separator(),
+            tab_toggle->Render() | hcenter | border, // Tab 切换按钮
+            tab_content | flex, // 根据 Index 显示内容
+            filler(),
+            hbox({ text(" LOG ") | bold | color(Color::Black) | bgcolor(Color::White), text(" " + g_log_msg) | color(Color::White) }) | border
         });
     });
 
-    // 刷新率控制
+    // 刷新线程
     std::thread refresh_thread([&screen] {
         while (ros::ok()) {
             screen.Post(Event::Custom);
@@ -426,9 +479,16 @@ int main(int argc, char** argv) {
         }
     });
 
+    // 启动时自动获取一次参数
+    std::thread([&]{
+        std::this_thread::sleep_for(std::chrono::seconds(1)); // 等 ROS 连接
+        p_ev_str = get_param("EKF2_EV_CTRL");
+        p_gps_str = get_param("EKF2_GPS_CTRL");
+        p_hgt_str = get_param("EKF2_HGT_REF");
+    }).detach();
+
     screen.Loop(renderer);
 
-    // 退出清理
     g_enable_constant_publish = false;
     ros::shutdown();
     if (ros_thread.joinable()) ros_thread.join();
@@ -437,5 +497,3 @@ int main(int argc, char** argv) {
 
     return 0;
 }
-
-
