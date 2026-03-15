@@ -1,0 +1,4 @@
+<launch>
+    <!-- Px4 Monitor Terminal -->
+    <node pkg="px4_monitor" type="px4_monitor_node" name="Px4Monitor" output="screen" /> 
+</launch>
