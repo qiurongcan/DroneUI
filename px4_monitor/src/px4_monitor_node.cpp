@@ -1,6 +1,3 @@
-
-
-
 #include <ros/ros.h>
 #include <mavros_msgs/State.h>
 #include <mavros_msgs/CommandBool.h>
@@ -11,7 +8,6 @@
 #include <geometry_msgs/TwistStamped.h>
 #include <tf/transform_datatypes.h>
 
-// === 新增：包含 VFR_HUD 和 BatteryState 的头文件 ===
 #include <mavros_msgs/VFR_HUD.h>
 #include <sensor_msgs/BatteryState.h>
 
@@ -44,7 +40,6 @@ struct DroneState {
     double vx = 0.0, vy = 0.0, vz = 0.0;
     double roll = 0.0, pitch = 0.0, yaw = 0.0;
 
-    // === 新增：存储油门和电池数据 ===
     double throttle = 0.0;
     double battery_voltage = 0.0;
     double battery_percentage = 0.0;
@@ -62,6 +57,12 @@ std::mutex g_target_mtx;
 
 std::string g_log_msg = "System Ready"; 
 std::atomic<bool> g_enable_constant_publish(true); 
+
+// === 修改 1: 引入任务运行标志位，防止线程重复创建 ===
+std::atomic<bool> g_task_running(false); 
+
+// === 修改 2: 引入位置控制锁 (False=关/绿/安全, True=开/红/允许发送) ===
+std::atomic<bool> g_ctrl_lock_open(false);
 
 // ROS 全局对象
 ros::Publisher g_local_pos_pub;
@@ -106,17 +107,15 @@ void vel_cb(const geometry_msgs::TwistStamped::ConstPtr& msg) {
     g_drone_state.vz = msg->twist.linear.z;
 }
 
-// === 新增：处理 VFR_HUD (包含油门等) 的回调函数 ===
 void vfr_hud_cb(const mavros_msgs::VFR_HUD::ConstPtr& msg) {
     std::lock_guard<std::mutex> lock(g_state_mtx);
-    g_drone_state.throttle = msg->throttle; // PX4中通常为 0.0 ~ 1.0 的浮点数
+    g_drone_state.throttle = msg->throttle; 
 }
 
-// === 新增：处理 BatteryState 的回调函数 ===
 void battery_cb(const sensor_msgs::BatteryState::ConstPtr& msg) {
     std::lock_guard<std::mutex> lock(g_state_mtx);
     g_drone_state.battery_voltage = msg->voltage;
-    g_drone_state.battery_percentage = msg->percentage; // 通常为 0.0 ~ 1.0 的浮点数
+    g_drone_state.battery_percentage = msg->percentage; 
 }
 
 void set_log(std::string msg) { g_log_msg = msg; }
@@ -190,10 +189,12 @@ void set_param(const std::string& param_id, const std::string& value_str) {
 // -----------------------------------------------------------------------------
 // 后台线程逻辑
 // -----------------------------------------------------------------------------
+// 发布位置姿态
 void constant_publisher_routine() {
     ros::Rate rate(20);
     while (ros::ok()) {
-        if (g_enable_constant_publish) {
+        // === 修改 2: 只有当 g_enable_constant_publish 为真 且 锁开关打开(g_ctrl_lock_open) 时才发送消息 ===
+        if (g_enable_constant_publish && g_ctrl_lock_open) {
             TargetSetPoint target;
             {
                 std::lock_guard<std::mutex> lock(g_target_mtx);
@@ -206,9 +207,15 @@ void constant_publisher_routine() {
     }
 }
 
+// 起飞的发布 
 void takeoff_routine(double h) {
+    // 任务开始前已经设置了 g_task_running = true
     set_log("Auto Takeoff Sequence Started...");
+    
+    // 起飞逻辑接管发布权，先暂停常规发布，并强制视为“锁打开”状态（因为是自动程序）
+    bool prev_lock_state = g_ctrl_lock_open;
     g_enable_constant_publish = false;
+    
     ros::Rate rate(20);
     
     double current_x, current_y, current_yaw;
@@ -221,6 +228,7 @@ void takeoff_routine(double h) {
 
     auto pose = create_pose(current_x, current_y, h, current_yaw);
 
+    // 发送一些设定点以初始化 Offboard
     for(int i=0; i<20 && ros::ok(); i++) {
         g_local_pos_pub.publish(pose);
         rate.sleep();
@@ -241,6 +249,7 @@ void takeoff_routine(double h) {
             last_req = ros::Time::now();
         }
 
+        // 持续发布起飞点
         g_local_pos_pub.publish(pose);
 
         if (state.mode == "OFFBOARD" && state.armed) {
@@ -252,12 +261,17 @@ void takeoff_routine(double h) {
                     g_target_sp.x = state.x; g_target_sp.y = state.y;
                     g_target_sp.z = state.z; g_target_sp.yaw = state.yaw;
                 }
-                break;
+                // 起飞完成后，如果之前没开锁，这里保持关闭，用户需要手动开锁才能控制
+                // 或者我们可以策略性地自动开锁，这里选择恢复原状
+                break; 
             }
         }
         rate.sleep();
     }
+    
     g_enable_constant_publish = true;
+    // === 修改 1: 任务结束，释放标志位 ===
+    g_task_running = false;
 }
 
 // -----------------------------------------------------------------------------
@@ -272,7 +286,6 @@ int main(int argc, char** argv) {
     ros::Subscriber local_pos_sub = nh.subscribe<geometry_msgs::PoseStamped>("mavros/local_position/pose", 10, pose_cb);
     ros::Subscriber velocity_sub = nh.subscribe<geometry_msgs::TwistStamped>("mavros/local_position/velocity_local", 10, vel_cb);
     
-    // === 新增：订阅 VFR_HUD 和 Battery 话题 ===
     ros::Subscriber vfr_hud_sub = nh.subscribe<mavros_msgs::VFR_HUD>("mavros/vfr_hud", 10, vfr_hud_cb);
     ros::Subscriber battery_sub = nh.subscribe<sensor_msgs::BatteryState>("mavros/battery", 10, battery_cb);
 
@@ -298,25 +311,51 @@ int main(int argc, char** argv) {
     auto tab_toggle = Toggle(&tab_entries, &tab_index);
 
     // =========================================================================
-    // 1. Tab 1 (飞行控制) - 逻辑与渲染解耦封装
+    // 1. Tab 1 (飞行控制)
     // =========================================================================
     Component input_takeoff_h = Input(&takeoff_h_str, "H");
+    
     auto btn_takeoff = Button("   AUTO TAKEOFF   ", [&] {
-        try { double h = std::stof(takeoff_h_str); std::thread(takeoff_routine, h).detach(); } catch (...) { set_log("Invalid Takeoff Height"); }
+        // === 修改 1: 检查任务是否正在运行 ===
+        if (g_task_running) {
+            set_log("Wait for current task...");
+            return;
+        }
+        try { 
+            double h = std::stof(takeoff_h_str); 
+            g_task_running = true; // 锁定
+            std::thread(takeoff_routine, h).detach(); 
+        } catch (...) { 
+            set_log("Invalid Takeoff Height"); 
+            g_task_running = false; // 异常时释放
+        }
     }, ButtonOption::Animated(Color::RedLight));
 
-    auto btn_offboard = Button("  OFFBOARD (FLY)  ", [&] { std::thread([]{ set_mode("OFFBOARD"); }).detach(); }, ButtonOption::Animated(Color::CyanLight));
+    auto btn_offboard = Button("  OFFBOARD (FLY)  ", [&] { 
+        // 简单模式切换不需要严格锁定，但为了防止连点，也可以加个简单的原子检查，这里仅对长任务做限制
+        std::thread([]{ set_mode("OFFBOARD"); }).detach(); 
+    }, ButtonOption::Animated(Color::CyanLight));
+    
     auto btn_loiter = Button("AUTO.LOITER (HOLD)", [&] { 
         std::thread([]{ set_mode("AUTO.LOITER"); }).detach(); 
+        // 切换到 Loiter 时同步一下当前位置到目标点，以便下次切回 Offboard 比较平滑
         DroneState c; { std::lock_guard<std::mutex> lock(g_state_mtx); c = g_drone_state; }
         { std::lock_guard<std::mutex> lock(g_target_mtx); g_target_sp = {c.x, c.y, c.z, c.yaw}; }
         tx_str = fmt(c.x); ty_str = fmt(c.y); tz_str = fmt(c.z); tyaw_str = fmt(c.yaw);
     }, ButtonOption::Animated(Color::GreenLight));
-    auto btn_land = Button("    AUTO.LAND     ", [&] { std::thread([]{ set_mode("AUTO.LAND"); }).detach(); }, ButtonOption::Animated(Color::YellowLight));
+    
+    auto btn_land = Button("    AUTO.LAND     ", [&] { 
+        std::thread([]{ set_mode("AUTO.LAND"); }).detach(); 
+    }, ButtonOption::Animated(Color::YellowLight));
 
     Component input_x = Input(&tx_str, "X"); Component input_y = Input(&ty_str, "Y");
     Component input_z = Input(&tz_str, "Z"); Component input_yaw = Input(&tyaw_str, "Yaw");
+    
     auto btn_send_sp = Button(" UPDATE SETPOINT ", [&] {
+        if (!g_ctrl_lock_open) {
+            set_log("Control Locked! Open switch first.");
+            return;
+        }
         try {
             std::lock_guard<std::mutex> lock(g_target_mtx);
             g_target_sp = {std::stof(tx_str), std::stof(ty_str), std::stof(tz_str), std::stof(tyaw_str)};
@@ -324,30 +363,66 @@ int main(int argc, char** argv) {
         } catch (...) { set_log("Invalid Input"); }
     }, ButtonOption::Animated(Color::BlueLight));
 
+    // === 修改 2: 新增位置控制锁开关 ===
+    auto btn_lock_toggle = Button(" LOCK ", [&] {
+        bool new_state = !g_ctrl_lock_open;
+        if (new_state) {
+            // 状态：关 -> 开 (变红，允许发送)
+            // 逻辑：一次打开还未设置值时，默认保持当前位置
+            DroneState c; 
+            { std::lock_guard<std::mutex> lock(g_state_mtx); c = g_drone_state; }
+            { 
+                std::lock_guard<std::mutex> lock(g_target_mtx); 
+                g_target_sp = {c.x, c.y, c.z, c.yaw}; 
+            }
+            // 更新UI输入框显示当前位置
+            tx_str = fmt(c.x); ty_str = fmt(c.y); tz_str = fmt(c.z); tyaw_str = fmt(c.yaw);
+            set_log("Control UNLOCKED. Hold Current Pos.");
+        } else {
+            // 状态：开 -> 关 (变绿，禁止发送)
+            set_log("Control LOCKED. Safety On.");
+        }
+        g_ctrl_lock_open = new_state;
+    }, ButtonOption::Simple());
+
     auto container_tab1 = Container::Horizontal({
         Container::Vertical({ Container::Horizontal({input_takeoff_h, btn_takeoff}), btn_offboard, btn_loiter, btn_land }),
-        Container::Vertical({ Container::Horizontal({input_x, input_y}), Container::Horizontal({input_z, input_yaw}), btn_send_sp })
+        Container::Vertical({ 
+            Container::Horizontal({input_x, input_y}), 
+            Container::Horizontal({input_z, input_yaw}), 
+            Container::Horizontal({btn_lock_toggle, btn_send_sp}) // 将锁按钮加入布局
+        })
     });
 
     auto tab1_renderer = Renderer(container_tab1, [&] {
         TargetSetPoint target;
         { std::lock_guard<std::mutex> lock(g_target_mtx); target = g_target_sp; }
         
+        // === 修改 2: 渲染锁按钮的样式 ===
+        bool is_open = g_ctrl_lock_open;
+        auto lock_style = is_open ? (bgcolor(Color::Red) | color(Color::White) | bold) : (bgcolor(Color::Green) | color(Color::Black) | bold);
+        auto lock_text = is_open ? " [ UNLOCKED (ACTIVE) ] " : " [  LOCKED (SAFE)    ] ";
+
         auto action_ui = window(text(" QUICK ACTIONS ") | bold | hcenter, vbox({
             hbox({ text(" Alt(m): ") | center, input_takeoff_h->Render() | size(WIDTH, EQUAL, 6) | border, filler(), btn_takeoff->Render() }),
             separatorLight(), btn_offboard->Render() | xflex, btn_loiter->Render() | xflex, btn_land->Render() | xflex
         }));
+        
         auto target_info = hbox({ text(" Target -> ") | dim, text(fmt(target.x) + ", " + fmt(target.y) + ", " + fmt(target.z) + " | Yaw: " + fmt(target.yaw)) | color(Color::Magenta) | bold });
+        
         auto nav_ui = window(text(" NAVIGATION (FLY TO) ") | bold | hcenter, vbox({
             hbox({ hbox({ text(" X(m): ") | center, input_x->Render() | size(WIDTH, EQUAL, 8) | border }) | flex, hbox({ text(" Y(m): ") | center, input_y->Render() | size(WIDTH, EQUAL, 8) | border }) | flex }),
             hbox({ hbox({ text(" Z(m): ") | center, input_z->Render() | size(WIDTH, EQUAL, 8) | border }) | flex, hbox({ text(" Yaw(°): ") | center, input_yaw->Render() | size(WIDTH, EQUAL, 6) | border }) | flex }),
-            filler(), btn_send_sp->Render() | hcenter, separatorLight(), target_info | hcenter
+            filler(), 
+            // 渲染锁和发送按钮
+            hbox({ btn_lock_toggle->Render() | lock_style | center, filler(), btn_send_sp->Render() | center }),
+            separatorLight(), target_info | hcenter
         }));
         return hbox({ action_ui | size(WIDTH, EQUAL, 35), nav_ui | flex });
     });
 
     // =========================================================================
-    // 2. Tab 2 (参数配置) - 逻辑与渲染解耦封装
+    // 2. Tab 2 (参数配置)
     // =========================================================================
     Component in_ev = Input(&p_ev_str, "Val"); Component in_gps = Input(&p_gps_str, "Val"); Component in_hgt = Input(&p_hgt_str, "Val");
     auto btn_get_ev = Button(" GET ", [&]{ p_ev_str = get_param("EKF2_EV_CTRL"); }, ButtonOption::Simple());
@@ -377,7 +452,7 @@ int main(int argc, char** argv) {
     });
 
     // =========================================================================
-    // 3. Tab 3 (Move Base) - 逻辑与渲染解耦封装
+    // 3. Tab 3 (Move Base)
     // =========================================================================
     Component in_mb_x = Input(&mb_x, "X"); Component in_mb_y = Input(&mb_y, "Y");
     Component in_mb_z = Input(&mb_z, "Z"); Component in_mb_yaw = Input(&mb_yaw, "Yaw");
@@ -385,13 +460,12 @@ int main(int argc, char** argv) {
     auto btn_send_mb = Button(" PUBLISH ", [&]{
         try {
             auto pose = create_pose(std::stof(mb_x), std::stof(mb_y), std::stof(mb_z), std::stof(mb_yaw));
-            g_move_base_goal_pub.publish(pose);
+            g_move_base_goal_pub.publish(pose); 
             set_log("Move Base Goal Published: " + mb_x + ", " + mb_y + ", " + mb_z);
         } catch(...) { set_log("Invalid Move Base Input"); }
     }, ButtonOption::Animated(Color::Green1));
 
     auto mb_comp = Container::Vertical({ Container::Horizontal({ in_mb_x, in_mb_y, in_mb_z, in_mb_yaw }), btn_send_mb });
-    // auto mb_comp = Container::Horizontal({ in_mb_x, in_mb_y, in_mb_z, in_mb_yaw , btn_send_mb});
 
     auto tab3_renderer = Renderer(mb_comp, [&] {
         return window(text(" ROS NAVIGATION (MOVE BASE) ") | bold | hcenter, vbox({
@@ -427,17 +501,13 @@ int main(int argc, char** argv) {
         DroneState current;
         { std::lock_guard<std::mutex> lock(g_state_mtx); current = g_drone_state; }
 
-        // === 新增：处理油门和电池数据的显示格式与动态颜色 ===
-        // 兼容处理：如果数据是 0~1 的小数则转为百分比显示
         double disp_thr = current.throttle <= 1.0 ? current.throttle * 100.0 : current.throttle;
         double disp_bat_pct = current.battery_percentage <= 1.0 ? current.battery_percentage * 100.0 : current.battery_percentage;
         
-        // 电池电量过低警告颜色 (低于20%红，低于40%黄)
         Color bat_color = Color::Green;
         if (disp_bat_pct > 0.1 && disp_bat_pct < 20.0) bat_color = Color::Red;
         else if (disp_bat_pct > 0.1 && disp_bat_pct < 40.0) bat_color = Color::Yellow;
 
-        // === 修改：在 SYSTEM STATUS 面板中追加这两行显示 ===
         auto status_panel = window(text(" SYSTEM STATUS ") | bold, vbox({
             hbox({ text(" Connection: ") | dim, text(current.connected ? "CONNECTED " : "DISCONNECTED") | color(current.connected ? Color::Green : Color::Red) | bold }),
             hbox({ text(" Flight Mode:") | dim, text(" " + current.mode) | color(Color::Yellow) | bold }),
@@ -445,6 +515,9 @@ int main(int argc, char** argv) {
             separatorLight(),
             hbox({ text(" Throttle:   ") | dim, text(fmt(disp_thr, 1) + "%") | color(Color::Cyan) | bold }),
             hbox({ text(" Battery:    ") | dim, text(fmt(current.battery_voltage, 2) + "V (" + fmt(disp_bat_pct, 0) + "%)") | color(bat_color) | bold }),
+            separatorLight(),
+            // 显示任务运行状态
+            hbox({ text(" Task Status:") | dim, text(g_task_running ? " BUSY" : " IDLE") | color(g_task_running ? Color::Red : Color::Green) })
         }));
 
         auto telemetry_content = hbox({
