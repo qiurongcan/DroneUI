@@ -1,15 +1,17 @@
-#include <ros/ros.h>
-#include <mavros_msgs/State.h>
-#include <mavros_msgs/CommandBool.h>
-#include <mavros_msgs/SetMode.h>
-#include <mavros_msgs/ParamGet.h>
-#include <mavros_msgs/ParamSet.h>
-#include <geometry_msgs/PoseStamped.h>
-#include <geometry_msgs/TwistStamped.h>
-#include <tf/transform_datatypes.h>
+#include <rclcpp/rclcpp.hpp>
+#include <mavros_msgs/msg/state.hpp>
+#include <mavros_msgs/srv/command_bool.hpp>
+#include <mavros_msgs/srv/set_mode.hpp>
+#include <mavros_msgs/srv/param_get.hpp>
+#include <mavros_msgs/srv/param_set.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
+#include <mavros_msgs/msg/vfr_hud.hpp>
+#include <sensor_msgs/msg/battery_state.hpp>
 
-#include <mavros_msgs/VFR_HUD.h>
-#include <sensor_msgs/BatteryState.h>
+// ROS 2 使用 TF2
+#include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Matrix3x3.h>
 
 #include <thread>
 #include <mutex>
@@ -18,6 +20,7 @@
 #include <sstream>
 #include <atomic>
 #include <vector>
+#include <chrono>
 
 // FTXUI 头文件
 #include <ftxui/dom/elements.hpp>
@@ -27,6 +30,7 @@
 #include <ftxui/component/screen_interactive.hpp>
 
 using namespace ftxui;
+using namespace std::chrono_literals;
 
 // -----------------------------------------------------------------------------
 // 数据结构
@@ -57,42 +61,39 @@ std::mutex g_target_mtx;
 
 std::string g_log_msg = "System Ready"; 
 std::atomic<bool> g_enable_constant_publish(true); 
-
-// === 修改 1: 引入任务运行标志位，防止线程重复创建 ===
 std::atomic<bool> g_task_running(false); 
-
-// === 修改 2: 引入位置控制锁 (False=关/绿/安全, True=开/红/允许发送) ===
 std::atomic<bool> g_ctrl_lock_open(false);
 
-// ROS 全局对象
-ros::Publisher g_local_pos_pub;
-ros::Publisher g_move_base_goal_pub;
-ros::ServiceClient g_arming_client;
-ros::ServiceClient g_set_mode_client;
-ros::ServiceClient g_param_get_client;
-ros::ServiceClient g_param_set_client;
+// ROS 2 全局对象
+std::shared_ptr<rclcpp::Node> g_node;
+rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr g_local_pos_pub;
+rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr g_move_base_goal_pub;
+rclcpp::Client<mavros_msgs::srv::CommandBool>::SharedPtr g_arming_client;
+rclcpp::Client<mavros_msgs::srv::SetMode>::SharedPtr g_set_mode_client;
+rclcpp::Client<mavros_msgs::srv::ParamGet>::SharedPtr g_param_get_client;
+rclcpp::Client<mavros_msgs::srv::ParamSet>::SharedPtr g_param_set_client;
 
 // -----------------------------------------------------------------------------
-// ROS 回调与辅助函数
+// ROS 2 回调与辅助函数
 // -----------------------------------------------------------------------------
-void state_cb(const mavros_msgs::State::ConstPtr& msg) {
+void state_cb(const mavros_msgs::msg::State::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(g_state_mtx);
     g_drone_state.connected = msg->connected;
     g_drone_state.armed = msg->armed;
     g_drone_state.mode = msg->mode;
 }
 
-void pose_cb(const geometry_msgs::PoseStamped::ConstPtr& msg) {
+void pose_cb(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(g_state_mtx);
     g_drone_state.x = msg->pose.position.x;
     g_drone_state.y = msg->pose.position.y;
     g_drone_state.z = msg->pose.position.z;
 
-    tf::Quaternion q(
+    tf2::Quaternion q(
         msg->pose.orientation.x, msg->pose.orientation.y,
         msg->pose.orientation.z, msg->pose.orientation.w
     );
-    tf::Matrix3x3 m(q);
+    tf2::Matrix3x3 m(q);
     double r, p, y;
     m.getRPY(r, p, y);
     g_drone_state.roll = r * 180.0 / M_PI;
@@ -100,19 +101,19 @@ void pose_cb(const geometry_msgs::PoseStamped::ConstPtr& msg) {
     g_drone_state.yaw = y * 180.0 / M_PI;
 }
 
-void vel_cb(const geometry_msgs::TwistStamped::ConstPtr& msg) {
+void vel_cb(const geometry_msgs::msg::TwistStamped::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(g_state_mtx);
     g_drone_state.vx = msg->twist.linear.x;
     g_drone_state.vy = msg->twist.linear.y;
     g_drone_state.vz = msg->twist.linear.z;
 }
 
-void vfr_hud_cb(const mavros_msgs::VFR_HUD::ConstPtr& msg) {
+void vfr_hud_cb(const mavros_msgs::msg::VFR_HUD::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(g_state_mtx);
     g_drone_state.throttle = msg->throttle; 
 }
 
-void battery_cb(const sensor_msgs::BatteryState::ConstPtr& msg) {
+void battery_cb(const sensor_msgs::msg::BatteryState::SharedPtr msg) {
     std::lock_guard<std::mutex> lock(g_state_mtx);
     g_drone_state.battery_voltage = msg->voltage;
     g_drone_state.battery_percentage = msg->percentage; 
@@ -126,15 +127,15 @@ std::string fmt(double val, int precision = 2) {
     return ss.str();
 }
 
-geometry_msgs::PoseStamped create_pose(double x, double y, double z, double yaw_deg) {
-    geometry_msgs::PoseStamped pose;
-    pose.header.stamp = ros::Time::now();
+geometry_msgs::msg::PoseStamped create_pose(double x, double y, double z, double yaw_deg) {
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header.stamp = g_node->now();
     pose.header.frame_id = "map";
     pose.pose.position.x = x;
     pose.pose.position.y = y;
     pose.pose.position.z = z;
 
-    tf::Quaternion q;
+    tf2::Quaternion q;
     q.setRPY(0, 0, yaw_deg * M_PI / 180.0);
     pose.pose.orientation.x = q.x();
     pose.pose.orientation.y = q.y();
@@ -143,44 +144,62 @@ geometry_msgs::PoseStamped create_pose(double x, double y, double z, double yaw_
     return pose;
 }
 
+// Helper 模板函数：处理 ROS 2 异步服务调用（阻塞等待结果）
+template<typename FutureT>
+bool wait_for_service_result(FutureT& future, int timeout_ms = 2000) {
+    return future.wait_for(std::chrono::milliseconds(timeout_ms)) == std::future_status::ready;
+}
+
 bool set_mode(std::string mode_name) {
-    mavros_msgs::SetMode offb_set_mode;
-    offb_set_mode.request.custom_mode = mode_name;
-    if (g_set_mode_client.call(offb_set_mode) && offb_set_mode.response.mode_sent) {
-        set_log("Mode switch to " + mode_name + " REQUESTED");
-        return true;
+    auto req = std::make_shared<mavros_msgs::srv::SetMode::Request>();
+    req->custom_mode = mode_name;
+    
+    auto future = g_set_mode_client->async_send_request(req);
+    if (wait_for_service_result(future)) {
+        if (future.get()->mode_sent) {
+            set_log("Mode switch to " + mode_name + " REQUESTED");
+            return true;
+        }
     }
     set_log("Failed to switch to " + mode_name);
     return false;
 }
 
 std::string get_param(const std::string& param_id) {
-    mavros_msgs::ParamGet srv;
-    srv.request.param_id = param_id;
-    if (g_param_get_client.call(srv) && srv.response.success) {
-        if (srv.response.value.integer != 0 || srv.response.value.real == 0.0) 
-            return std::to_string(srv.response.value.integer);
-        else 
-            return fmt(srv.response.value.real);
+    auto req = std::make_shared<mavros_msgs::srv::ParamGet::Request>();
+    req->param_id = param_id;
+    
+    auto future = g_param_get_client->async_send_request(req);
+    if (wait_for_service_result(future)) {
+        auto res = future.get();
+        if (res->success) {
+            if (res->value.integer != 0 || res->value.real == 0.0) 
+                return std::to_string(res->value.integer);
+            else 
+                return fmt(res->value.real);
+        }
     }
     return "ERR";
 }
 
 void set_param(const std::string& param_id, const std::string& value_str) {
     try {
-        mavros_msgs::ParamSet srv;
-        srv.request.param_id = param_id;
+        auto req = std::make_shared<mavros_msgs::srv::ParamSet::Request>();
+        req->param_id = param_id;
         if (value_str.find('.') != std::string::npos) {
-            srv.request.value.real = std::stof(value_str);
+            req->value.real = std::stof(value_str);
         } else {
-            srv.request.value.integer = std::stol(value_str);
+            req->value.integer = std::stol(value_str);
         }
         
-        if (g_param_set_client.call(srv) && srv.response.success) {
-            set_log("Set " + param_id + " success!");
-        } else {
-            set_log("Failed to set " + param_id);
+        auto future = g_param_set_client->async_send_request(req);
+        if (wait_for_service_result(future)) {
+            if (future.get()->success) {
+                set_log("Set " + param_id + " success!");
+                return;
+            }
         }
+        set_log("Failed to set " + param_id);
     } catch (...) {
         set_log("Invalid Param Format");
     }
@@ -189,11 +208,9 @@ void set_param(const std::string& param_id, const std::string& value_str) {
 // -----------------------------------------------------------------------------
 // 后台线程逻辑
 // -----------------------------------------------------------------------------
-// 发布位置姿态
 void constant_publisher_routine() {
-    ros::Rate rate(20);
-    while (ros::ok()) {
-        // === 修改 2: 只有当 g_enable_constant_publish 为真 且 锁开关打开(g_ctrl_lock_open) 时才发送消息 ===
+    rclcpp::Rate rate(20);
+    while (rclcpp::ok()) {
         if (g_enable_constant_publish && g_ctrl_lock_open) {
             TargetSetPoint target;
             {
@@ -201,22 +218,19 @@ void constant_publisher_routine() {
                 target = g_target_sp;
             }
             auto pose = create_pose(target.x, target.y, target.z, target.yaw);
-            g_local_pos_pub.publish(pose);
+            g_local_pos_pub->publish(pose);
         }
         rate.sleep();
     }
 }
 
-// 起飞的发布 
 void takeoff_routine(double h) {
-    // 任务开始前已经设置了 g_task_running = true
     set_log("Auto Takeoff Sequence Started...");
     
-    // 起飞逻辑接管发布权，先暂停常规发布，并强制视为“锁打开”状态（因为是自动程序）
     bool prev_lock_state = g_ctrl_lock_open;
     g_enable_constant_publish = false;
     
-    ros::Rate rate(20);
+    rclcpp::Rate rate(20);
     
     double current_x, current_y, current_yaw;
     {
@@ -228,29 +242,30 @@ void takeoff_routine(double h) {
 
     auto pose = create_pose(current_x, current_y, h, current_yaw);
 
-    // 发送一些设定点以初始化 Offboard
-    for(int i=0; i<20 && ros::ok(); i++) {
-        g_local_pos_pub.publish(pose);
+    for(int i=0; i<20 && rclcpp::ok(); i++) {
+        g_local_pos_pub->publish(pose);
         rate.sleep();
     }
 
     set_mode("OFFBOARD");
     
-    mavros_msgs::CommandBool arm_cmd;
-    arm_cmd.request.value = true;
-    ros::Time last_req = ros::Time::now();
+    auto arm_req = std::make_shared<mavros_msgs::srv::CommandBool::Request>();
+    arm_req->value = true;
+    rclcpp::Time last_req = g_node->now();
 
-    while(ros::ok()) {
+    while(rclcpp::ok()) {
         DroneState state;
         { std::lock_guard<std::mutex> lock(g_state_mtx); state = g_drone_state; }
 
-        if (!state.armed && (ros::Time::now() - last_req > ros::Duration(2.0))) {
-            if(g_arming_client.call(arm_cmd) && arm_cmd.response.success) set_log("Vehicle ARMED");
-            last_req = ros::Time::now();
+        if (!state.armed && (g_node->now() - last_req > rclcpp::Duration::from_seconds(2.0))) {
+            auto future = g_arming_client->async_send_request(arm_req);
+            if (wait_for_service_result(future, 500) && future.get()->success) {
+                set_log("Vehicle ARMED");
+            }
+            last_req = g_node->now();
         }
 
-        // 持续发布起飞点
-        g_local_pos_pub.publish(pose);
+        g_local_pos_pub->publish(pose);
 
         if (state.mode == "OFFBOARD" && state.armed) {
             if (std::abs(state.z - h) < 0.2) {
@@ -261,8 +276,6 @@ void takeoff_routine(double h) {
                     g_target_sp.x = state.x; g_target_sp.y = state.y;
                     g_target_sp.z = state.z; g_target_sp.yaw = state.yaw;
                 }
-                // 起飞完成后，如果之前没开锁，这里保持关闭，用户需要手动开锁才能控制
-                // 或者我们可以策略性地自动开锁，这里选择恢复原状
                 break; 
             }
         }
@@ -270,7 +283,6 @@ void takeoff_routine(double h) {
     }
     
     g_enable_constant_publish = true;
-    // === 修改 1: 任务结束，释放标志位 ===
     g_task_running = false;
 }
 
@@ -278,26 +290,26 @@ void takeoff_routine(double h) {
 // 主函数
 // -----------------------------------------------------------------------------
 int main(int argc, char** argv) {
-    ros::init(argc, argv, "px4_ftxui_control");
-    ros::NodeHandle nh;
+    rclcpp::init(argc, argv);
+    g_node = rclcpp::Node::make_shared("px4_ftxui_control");
 
-    // ROS Init
-    ros::Subscriber state_sub = nh.subscribe<mavros_msgs::State>("mavros/state", 10, state_cb);
-    ros::Subscriber local_pos_sub = nh.subscribe<geometry_msgs::PoseStamped>("mavros/local_position/pose", 10, pose_cb);
-    ros::Subscriber velocity_sub = nh.subscribe<geometry_msgs::TwistStamped>("mavros/local_position/velocity_local", 10, vel_cb);
+    // ROS 2 Init (QoS 设为 10)
+    auto state_sub = g_node->create_subscription<mavros_msgs::msg::State>("mavros/state", 10, state_cb);
+    auto local_pos_sub = g_node->create_subscription<geometry_msgs::msg::PoseStamped>("mavros/local_position/pose", 10, pose_cb);
+    auto velocity_sub = g_node->create_subscription<geometry_msgs::msg::TwistStamped>("mavros/local_position/velocity_local", 10, vel_cb);
+    auto vfr_hud_sub = g_node->create_subscription<mavros_msgs::msg::VFR_HUD>("mavros/vfr_hud", 10, vfr_hud_cb);
+    auto battery_sub = g_node->create_subscription<sensor_msgs::msg::BatteryState>("mavros/battery", 10, battery_cb);
+
+    g_local_pos_pub = g_node->create_publisher<geometry_msgs::msg::PoseStamped>("mavros/setpoint_position/local", 10);
+    g_move_base_goal_pub = g_node->create_publisher<geometry_msgs::msg::PoseStamped>("move_base_simple/goal", 10);
     
-    ros::Subscriber vfr_hud_sub = nh.subscribe<mavros_msgs::VFR_HUD>("mavros/vfr_hud", 10, vfr_hud_cb);
-    ros::Subscriber battery_sub = nh.subscribe<sensor_msgs::BatteryState>("mavros/battery", 10, battery_cb);
+    g_arming_client = g_node->create_client<mavros_msgs::srv::CommandBool>("mavros/cmd/arming");
+    g_set_mode_client = g_node->create_client<mavros_msgs::srv::SetMode>("mavros/set_mode");
+    g_param_get_client = g_node->create_client<mavros_msgs::srv::ParamGet>("mavros/param/get");
+    g_param_set_client = g_node->create_client<mavros_msgs::srv::ParamSet>("mavros/param/set");
 
-    g_local_pos_pub = nh.advertise<geometry_msgs::PoseStamped>("mavros/setpoint_position/local", 10);
-    g_move_base_goal_pub = nh.advertise<geometry_msgs::PoseStamped>("move_base_simple/goal", 10);
-    
-    g_arming_client = nh.serviceClient<mavros_msgs::CommandBool>("mavros/cmd/arming");
-    g_set_mode_client = nh.serviceClient<mavros_msgs::SetMode>("mavros/set_mode");
-    g_param_get_client = nh.serviceClient<mavros_msgs::ParamGet>("mavros/param/get");
-    g_param_set_client = nh.serviceClient<mavros_msgs::ParamSet>("mavros/param/set");
-
-    std::thread ros_thread([](){ ros::spin(); });
+    // 独立线程处理 ROS Spin
+    std::thread ros_thread([](){ rclcpp::spin(g_node); });
     std::thread pub_thread(constant_publisher_routine);
 
     // --- UI State Variables ---
@@ -316,29 +328,26 @@ int main(int argc, char** argv) {
     Component input_takeoff_h = Input(&takeoff_h_str, "H");
     
     auto btn_takeoff = Button("   AUTO TAKEOFF   ", [&] {
-        // === 修改 1: 检查任务是否正在运行 ===
         if (g_task_running) {
             set_log("Wait for current task...");
             return;
         }
         try { 
             double h = std::stof(takeoff_h_str); 
-            g_task_running = true; // 锁定
+            g_task_running = true; 
             std::thread(takeoff_routine, h).detach(); 
         } catch (...) { 
             set_log("Invalid Takeoff Height"); 
-            g_task_running = false; // 异常时释放
+            g_task_running = false; 
         }
     }, ButtonOption::Animated(Color::RedLight));
 
     auto btn_offboard = Button("  OFFBOARD (FLY)  ", [&] { 
-        // 简单模式切换不需要严格锁定，但为了防止连点，也可以加个简单的原子检查，这里仅对长任务做限制
         std::thread([]{ set_mode("OFFBOARD"); }).detach(); 
     }, ButtonOption::Animated(Color::CyanLight));
     
     auto btn_loiter = Button("AUTO.LOITER (HOLD)", [&] { 
         std::thread([]{ set_mode("AUTO.LOITER"); }).detach(); 
-        // 切换到 Loiter 时同步一下当前位置到目标点，以便下次切回 Offboard 比较平滑
         DroneState c; { std::lock_guard<std::mutex> lock(g_state_mtx); c = g_drone_state; }
         { std::lock_guard<std::mutex> lock(g_target_mtx); g_target_sp = {c.x, c.y, c.z, c.yaw}; }
         tx_str = fmt(c.x); ty_str = fmt(c.y); tz_str = fmt(c.z); tyaw_str = fmt(c.yaw);
@@ -363,23 +372,18 @@ int main(int argc, char** argv) {
         } catch (...) { set_log("Invalid Input"); }
     }, ButtonOption::Animated(Color::BlueLight));
 
-    // === 修改 2: 新增位置控制锁开关 ===
     auto btn_lock_toggle = Button(" LOCK ", [&] {
         bool new_state = !g_ctrl_lock_open;
         if (new_state) {
-            // 状态：关 -> 开 (变红，允许发送)
-            // 逻辑：一次打开还未设置值时，默认保持当前位置
             DroneState c; 
             { std::lock_guard<std::mutex> lock(g_state_mtx); c = g_drone_state; }
             { 
                 std::lock_guard<std::mutex> lock(g_target_mtx); 
                 g_target_sp = {c.x, c.y, c.z, c.yaw}; 
             }
-            // 更新UI输入框显示当前位置
             tx_str = fmt(c.x); ty_str = fmt(c.y); tz_str = fmt(c.z); tyaw_str = fmt(c.yaw);
             set_log("Control UNLOCKED. Hold Current Pos.");
         } else {
-            // 状态：开 -> 关 (变绿，禁止发送)
             set_log("Control LOCKED. Safety On.");
         }
         g_ctrl_lock_open = new_state;
@@ -390,7 +394,7 @@ int main(int argc, char** argv) {
         Container::Vertical({ 
             Container::Horizontal({input_x, input_y}), 
             Container::Horizontal({input_z, input_yaw}), 
-            Container::Horizontal({btn_lock_toggle, btn_send_sp}) // 将锁按钮加入布局
+            Container::Horizontal({btn_lock_toggle, btn_send_sp})
         })
     });
 
@@ -398,7 +402,6 @@ int main(int argc, char** argv) {
         TargetSetPoint target;
         { std::lock_guard<std::mutex> lock(g_target_mtx); target = g_target_sp; }
         
-        // === 修改 2: 渲染锁按钮的样式 ===
         bool is_open = g_ctrl_lock_open;
         auto lock_style = is_open ? (bgcolor(Color::Red) | color(Color::White) | bold) : (bgcolor(Color::Green) | color(Color::Black) | bold);
         auto lock_text = is_open ? " [ UNLOCKED (ACTIVE) ] " : " [  LOCKED (SAFE)    ] ";
@@ -414,7 +417,6 @@ int main(int argc, char** argv) {
             hbox({ hbox({ text(" X(m): ") | center, input_x->Render() | size(WIDTH, EQUAL, 8) | border }) | flex, hbox({ text(" Y(m): ") | center, input_y->Render() | size(WIDTH, EQUAL, 8) | border }) | flex }),
             hbox({ hbox({ text(" Z(m): ") | center, input_z->Render() | size(WIDTH, EQUAL, 8) | border }) | flex, hbox({ text(" Yaw(°): ") | center, input_yaw->Render() | size(WIDTH, EQUAL, 6) | border }) | flex }),
             filler(), 
-            // 渲染锁和发送按钮
             hbox({ btn_lock_toggle->Render() | lock_style | center, filler(), btn_send_sp->Render() | center }),
             separatorLight(), target_info | hcenter
         }));
@@ -425,12 +427,12 @@ int main(int argc, char** argv) {
     // 2. Tab 2 (参数配置)
     // =========================================================================
     Component in_ev = Input(&p_ev_str, "Val"); Component in_gps = Input(&p_gps_str, "Val"); Component in_hgt = Input(&p_hgt_str, "Val");
-    auto btn_get_ev = Button(" GET ", [&]{ p_ev_str = get_param("EKF2_EV_CTRL"); }, ButtonOption::Simple());
-    auto btn_set_ev = Button(" SET ", [&]{ set_param("EKF2_EV_CTRL", p_ev_str); }, ButtonOption::Animated(Color::Red));
-    auto btn_get_gps = Button(" GET ", [&]{ p_gps_str = get_param("EKF2_GPS_CTRL"); }, ButtonOption::Simple());
-    auto btn_set_gps = Button(" SET ", [&]{ set_param("EKF2_GPS_CTRL", p_gps_str); }, ButtonOption::Animated(Color::Red));
-    auto btn_get_hgt = Button(" GET ", [&]{ p_hgt_str = get_param("EKF2_HGT_REF"); }, ButtonOption::Simple());
-    auto btn_set_hgt = Button(" SET ", [&]{ set_param("EKF2_HGT_REF", p_hgt_str); }, ButtonOption::Animated(Color::Red));
+    auto btn_get_ev = Button(" GET ", [&]{ std::thread([]{ p_ev_str = get_param("EKF2_EV_CTRL"); }).detach(); }, ButtonOption::Simple());
+    auto btn_set_ev = Button(" SET ", [&]{ std::thread([]{ set_param("EKF2_EV_CTRL", p_ev_str); }).detach(); }, ButtonOption::Animated(Color::Red));
+    auto btn_get_gps = Button(" GET ", [&]{ std::thread([]{ p_gps_str = get_param("EKF2_GPS_CTRL"); }).detach(); }, ButtonOption::Simple());
+    auto btn_set_gps = Button(" SET ", [&]{ std::thread([]{ set_param("EKF2_GPS_CTRL", p_gps_str); }).detach(); }, ButtonOption::Animated(Color::Red));
+    auto btn_get_hgt = Button(" GET ", [&]{ std::thread([]{ p_hgt_str = get_param("EKF2_HGT_REF"); }).detach(); }, ButtonOption::Simple());
+    auto btn_set_hgt = Button(" SET ", [&]{ std::thread([]{ set_param("EKF2_HGT_REF", p_hgt_str); }).detach(); }, ButtonOption::Animated(Color::Red));
 
     auto params_comp = Container::Vertical({
         Container::Horizontal({ in_ev, btn_set_ev, btn_get_ev }),
@@ -460,7 +462,7 @@ int main(int argc, char** argv) {
     auto btn_send_mb = Button(" PUBLISH ", [&]{
         try {
             auto pose = create_pose(std::stof(mb_x), std::stof(mb_y), std::stof(mb_z), std::stof(mb_yaw));
-            g_move_base_goal_pub.publish(pose); 
+            g_move_base_goal_pub->publish(pose); 
             set_log("Move Base Goal Published: " + mb_x + ", " + mb_y + ", " + mb_z);
         } catch(...) { set_log("Invalid Move Base Input"); }
     }, ButtonOption::Animated(Color::Green1));
@@ -486,16 +488,11 @@ int main(int argc, char** argv) {
     // 4. 全局布局引擎
     // =========================================================================
     auto tab_container = Container::Tab({ tab1_renderer, tab2_renderer, tab3_renderer }, &tab_index);
-    
-    auto main_container = Container::Vertical({
-        tab_toggle,
-        tab_container
-    });
-
+    auto main_container = Container::Vertical({ tab_toggle, tab_container });
     auto screen = ScreenInteractive::Fullscreen();
 
     // =========================================================================
-    // 5. 主渲染逻辑 (Main Renderer)
+    // 5. 主渲染逻辑
     // =========================================================================
     auto main_renderer = Renderer(main_container, [&] {
         DroneState current;
@@ -516,7 +513,6 @@ int main(int argc, char** argv) {
             hbox({ text(" Throttle:   ") | dim, text(fmt(disp_thr, 1) + "%") | color(Color::Cyan) | bold }),
             hbox({ text(" Battery:    ") | dim, text(fmt(current.battery_voltage, 2) + "V (" + fmt(disp_bat_pct, 0) + "%)") | color(bat_color) | bold }),
             separatorLight(),
-            // 显示任务运行状态
             hbox({ text(" Task Status:") | dim, text(g_task_running ? " BUSY" : " IDLE") | color(g_task_running ? Color::Red : Color::Green) })
         }));
 
@@ -538,7 +534,7 @@ int main(int argc, char** argv) {
         auto data_panel = window(text(" TELEMETRY DATA ") | bold, telemetry_content);
 
         return vbox({
-            text("✈ PX4 ROS1 COMMAND CENTER") | bold | hcenter | color(Color::Cyan),
+            text("✈ PX4 ROS2 COMMAND CENTER") | bold | hcenter | color(Color::Cyan),
             separatorDouble(),
             hbox({ status_panel | size(WIDTH, EQUAL, 35), data_panel | flex }),
             separator(),
@@ -551,7 +547,7 @@ int main(int argc, char** argv) {
 
     // 刷新线程
     std::thread refresh_thread([&screen] {
-        while (ros::ok()) {
+        while (rclcpp::ok()) {
             screen.Post(Event::Custom);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
@@ -567,7 +563,8 @@ int main(int argc, char** argv) {
     screen.Loop(main_renderer); 
 
     g_enable_constant_publish = false;
-    ros::shutdown();
+    rclcpp::shutdown();
+    
     if (ros_thread.joinable()) ros_thread.join();
     if (pub_thread.joinable()) pub_thread.join();
     if (refresh_thread.joinable()) refresh_thread.join();
